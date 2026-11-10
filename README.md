@@ -1,169 +1,164 @@
 # envelope
 
-macOS notifications for Claude Code and Codex sessions. When an agent finishes, needs
-you, or starts compacting its context, a notification appears in the top right of the
-screen. Clicking it takes you back to the app the session is running in, and where
-possible to the exact session.
-
-One script (`hooks/notify.sh`) serves both agents, so the notifications look and behave
-the same.
+macOS notifications for Claude Code (CLI or desktop) and Codex (CLI, IDE, or local
+ChatGPT Work chats). One shared hook gives both providers the same notification
+layout, sounds, expiry, and click behavior, with their own names and icons.
 
 ## What you get
 
-| Event | Title status | Sound | Claude Code hook | Codex hook |
-|---|---|---|---|---|
-| Agent finished its turn | `finished` | Glass | `Stop` | `Stop` |
-| Agent is waiting on you | `needs you` | Sosumi | `Notification` | `PermissionRequest` |
-| Context is being compacted | `compacting context` | Pop | `PreCompact` | `PreCompact` |
+| Event | Status / sound | Claude Code | Codex / local Work |
+|---|---|---|---|
+| Main agent finishes | `finished` / Glass | `Stop` | `Stop` |
+| User-facing permission prompt | `needs you` / Sosumi | `Notification` | `PermissionRequest` when reviewed by the user |
+| Main agent asks a question | `needs you` / Sosumi | `PreToolUse` on `AskUserQuestion` | `PreToolUse` on `request_user_input` and `request_user_input_async` |
+| Context compaction starts | `compacting context` / Pop | `PreCompact` | `PreCompact` |
+| User sends a new message | Clears the session's notification | `UserPromptSubmit` | `UserPromptSubmit` |
 
-- **Title:** `<Provider> <Model> <Effort>[ Fast]: <status> in <dir>`, for example
-  `Claude Opus 5.5 High: finished in my-project`. `Fast` only appears in fast mode.
-- **Subtitle:** where the session lives (Claude app, iTerm2 session, Android Studio, ...).
-- **Body:** the agent's last message, the permission being requested, or the compaction reason.
-- **Click:** brings the hosting app forward.
-  - Claude desktop app: opens that exact Code session.
-  - ChatGPT / Codex desktop app: opens that exact thread.
-  - iTerm2: selects that exact session, or the tmux window and pane.
-  - Android Studio, Terminal and anything else: activates the app.
-- **Expiry:** each notification removes itself after 5 minutes. A newer notification from
-  the same session replaces the older one instead of stacking.
-- No notification is sent if the iTerm2 session that produced it is already in front of you.
+- **Title:** `<Provider> <Model> <Effort>[ Fast]: <status> in <dir>`.
+  Model, effort, and Fast are included when available from the payload, transcript,
+  or provider settings.
+- **Image:** Claude for Claude Code; ChatGPT for Codex and local Work. The small
+  system icon and Notification Center permissions belong to `terminal-notifier`;
+  version 3 removed per-notification app-icon overrides.
+- **Body:** the final message, question, permission description, or compaction reason.
+- **Click:** activates the host app. Claude Code desktop and local ChatGPT Work also
+  get a session/thread deep link. iTerm2 selects the session or tmux pane. Other
+  terminals and IDEs are activated without selecting a particular tab.
+- **Expiry:** removes the notification after five minutes. A new notification from
+  the same provider/session replaces the old one; its predecessor cannot expire it.
+- **Focus:** skips notifications from the exact iTerm2 session already in front of
+  you (except tmux, whose recorded iTerm session can be stale).
+
+### Subagents and automatic review
+
+Only the main agent notifies. Child questions, permissions, compactions, completion,
+reviewer agents, and `SubagentStop` are silent. Identification uses the hook's
+`agent_id`, Claude subagent paths/sidechain metadata, and Codex session metadata
+(including worker and guardian sources). The main agent can relay a child's question
+to the user, at which point it notifies normally.
+
+Codex's `PermissionRequest` happens **before** approval review; it is not a signal
+that a human is being asked. Envelope suppresses that event when the effective
+reviewer is `auto_review` (or the older `guardian_subagent`). It prefers a reviewer
+in the payload, then the latest transcript turn context, then the top-level user
+config. Manual-review permissions still notify. Root questions and completion still
+notify in automatic-review mode. Envelope never approves or denies an action and
+never changes the selected approval policy.
+
+There is no documented post-review, human-prompt hook. A rejected review that needs
+human attention is reported when the root agent asks a question or ends its turn.
+If the runtime omits reviewer metadata and uses a project/profile override, the
+user-config fallback may be incomplete. Transcript fields are a best-effort fallback,
+not a stable provider API. See the [Codex hooks reference](https://learn.chatgpt.com/docs/hooks)
+and [Claude Code hooks reference](https://code.claude.com/docs/en/hooks).
 
 ## Requirements
 
-- macOS (Apple Silicon or Intel)
-- [Homebrew](https://brew.sh)
-- `jq` (ships with macOS 15 and later; otherwise `brew install jq`)
-- Claude Code and/or Codex already installed and signed in
+- macOS, Apple Silicon or Intel
+- [Homebrew](https://brew.sh) and `jq` (`brew install jq` if missing)
+- Claude Code and/or Codex installed
 
-The installer adds `terminal-notifier` 3.1.0 or newer for you. Older versions cannot
-remove notifications on current macOS, which breaks the 5-minute expiry.
+The installer installs or upgrades `terminal-notifier` to at least 3.1.0, needed for
+notification removal on current macOS.
 
-## Setup on a new machine
+## Setup
 
-1. Clone the repo somewhere permanent:
+```bash
+git clone https://github.com/amruth-sn/envelope.git ~/envelope
+~/envelope/install.sh
+~/envelope/test.sh claude
+~/envelope/test.sh codex
+```
 
-   ```bash
-   git clone https://github.com/amruth-sn/envelope.git ~/envelope
-   ```
+Allow **terminal-notifier** in **System Settings > Notifications**, choosing Banners
+or Alerts. Also check Focus / Do Not Disturb if a test does not appear.
 
-2. Run the installer:
+Review the Codex hooks once using `/hooks` in the CLI or **Settings > Hooks** in the
+desktop app. New or changed hook definitions need review; the installer does not
+mark hooks trusted for you. Restart existing Claude Code / Codex chats to load the
+new registrations.
 
-   ```bash
-   ~/envelope/install.sh
-   ```
-
-   It installs `terminal-notifier` if needed, puts the scripts in `~/.claude/hooks/`, and
-   registers the hooks in `~/.claude/settings.json` and `~/.codex/hooks.json`. Existing
-   settings and hooks are kept. Any config file it changes is first copied to
-   `<file>.bak-<timestamp>`. Running it again is safe and changes nothing.
-
-3. Send a test notification:
-
-   ```bash
-   ~/envelope/test.sh
-   ```
-
-4. Allow the notifications. The first test makes `terminal-notifier` show up in
-   **System Settings > Notifications**. Open it there, turn on **Allow notifications**,
-   and pick **Banners** or **Alerts**. If nothing appeared in step 3, this is why. Run the
-   test again afterwards. Also check that Focus / Do Not Disturb is off.
-
-5. Codex only: trust the hooks. Codex does not run a new hook until you approve it once.
-   - Codex CLI: run `/hooks` inside a session and approve the three `notify.sh codex` entries.
-   - ChatGPT desktop app: **Settings > Hooks**, approve the same three entries.
-
-6. Restart any Claude Code or Codex sessions that were already running. New sessions pick
-   the hooks up automatically.
-
-### Installer options
+The installer backs up changed config files, preserves unrelated hooks and settings,
+and can be rerun without duplicating registrations or dropping existing trust data.
+Upgrading migrates the old `~/.claude/hooks/notify.sh` commands to the shared location.
+The legacy entry point forwards to the new hook so existing chats get the fixes
+immediately. Legacy click handlers remain until uninstall so notifications already
+posted can still open their original target.
 
 | Option | Effect |
 |---|---|
-| `--link` | Symlink the scripts into `~/.claude/hooks/` instead of copying them. `git pull` then updates the live hooks. Do not move or delete the clone afterwards. |
-| `--iterm-status` | Also register iTerm2's `cc-status` helper on the Claude Code events it listens to. See [iTerm2 status helper](#iterm2-status-helper). |
-| `--no-codex` | Only set up Claude Code. |
-| `--no-claude` | Only set up Codex. |
+| `--link` | Symlink shared files to this checkout; `git pull` updates the installed scripts. Keep the checkout in place. |
+| `--no-claude` | Skip changes to Claude settings. |
+| `--no-codex` | Skip changes to Codex hooks. |
+| `--iterm-status` | Also register iTerm2's existing `~/.config/iterm2/cc-status` helper for Claude Code. |
 
-Without `--link`, re-run `install.sh` after a `git pull` to update the installed copies.
+Without `--link`, rerun `install.sh` after pulling updates.
+
+## Files and commands
+
+| Path | Content |
+|---|---|
+| `~/.local/share/envelope/hooks/` | Shared scripts, Claude icon, and ChatGPT icon. Respects `XDG_DATA_HOME`. |
+| `~/.claude/settings.json` | Explicit `notify.sh claude` registrations. |
+| `~/.codex/hooks.json` | Explicit `notify.sh codex` registrations. Respects `CODEX_HOME`. |
+
+Both providers use the same number of arguments. `notify.sh chatgpt` is also accepted
+as an alias for `codex`. A bare `notify.sh` only works when the payload/transcript or
+agent environment identifies its provider; unknown callers are skipped. It never
+defaults to Claude. Config commands and notification click targets are shell-quoted
+so installation paths with spaces and apostrophes work.
+
+`~/.codex/config.toml` is not modified. If an existing legacy `notify` command also
+posts desktop notifications, disable that registration yourself to avoid duplicates.
+
+## Configuration
+
+Set variables in the agent's launch environment (or Claude Code's settings `env`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENT_NOTIFY_TTL` | `300` | Seconds until expiry. |
+| `AGENT_NOTIFY_SKIP_IF_FOCUSED` | `1` | Skip the frontmost originating iTerm2 session; `0` always notifies. |
+| `AGENT_NOTIFY_NOTIFIER` | Homebrew `terminal-notifier` | Override the notifier executable, useful for isolated tests. |
+
+`CLAUDE_NOTIFY_SKIP_IF_FOCUSED` is still accepted for older setups; the neutral
+variable takes precedence. Replace the provider's `claude-icon.png` or
+`chatgpt-icon.png` in the shared directory to customize its image. The bundled
+ChatGPT image comes from the installed ChatGPT desktop app.
 
 ## Testing
 
 ```bash
-~/envelope/test.sh                      # Claude, "finished"
-~/envelope/test.sh claude Notification  # Claude, "needs you"
-~/envelope/test.sh claude PreCompact    # Claude, "compacting context"
-~/envelope/test.sh codex                # Codex, "finished"
-AGENT_NOTIFY_TTL=10 ~/envelope/test.sh  # disappears after 10 seconds
+~/envelope/test.sh claude
+~/envelope/test.sh codex
+~/envelope/test.sh chatgpt PreToolUse
+~/envelope/test.sh claude Notification
+~/envelope/test.sh codex PermissionRequest
+~/envelope/test.sh codex PreCompact
+AGENT_NOTIFY_TTL=10 ~/envelope/test.sh codex
+python3 -m unittest discover -s ~/envelope/tests -v
 ```
 
-The test payload has no transcript, so the model in the title falls back to your
-configured default. Click the notification to check that it lands in the app you ran the
-test from.
+`test.sh` requires a provider. Synthetic permission tests explicitly select manual
+review so they remain visible even if your real chats use automatic review. The
+Python suite uses a fake notifier and temporary home directories; it never posts
+real notifications or modifies your live agent settings.
 
-## Configuration
+## Troubleshooting and limits
 
-Both are environment variables read by `notify.sh`. Set them in the environment the
-agent is launched from, or in the `env` block of `~/.claude/settings.json`.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `AGENT_NOTIFY_TTL` | `300` | Seconds before a notification removes itself. |
-| `CLAUDE_NOTIFY_SKIP_IF_FOCUSED` | `1` | `1` skips the notification when the originating iTerm2 session is already frontmost. `0` always notifies. |
-
-To change the picture attached to the notification, replace
-`~/.claude/hooks/claude-icon.png`.
-
-## What the installer writes
-
-| Path | Content |
-|---|---|
-| `~/.claude/hooks/notify.sh` | The hook. `notify.sh` for Claude Code, `notify.sh codex` for Codex. |
-| `~/.claude/hooks/focus-host.sh` | Click handler. Activates the app and opens the session deep link. |
-| `~/.claude/hooks/focus-terminal.sh` | Older iTerm2/tmux-only click handler, kept so notifications posted before an upgrade still work. |
-| `~/.claude/hooks/claude-icon.png` | Image attached to each notification. |
-| `~/.claude/settings.json` | Adds `notify.sh` under `hooks.Notification`, `hooks.Stop`, `hooks.PreCompact`. |
-| `~/.codex/hooks.json` | Adds `notify.sh codex` under `hooks.Stop`, `hooks.PermissionRequest`, `hooks.PreCompact`. |
-
-Hook commands are written with absolute paths based on the current `$HOME`, so nothing
-needs editing per machine. `~/.codex/config.toml` is never touched; its `notify` setting
-can stay pointed at whatever it already uses.
-
-## iTerm2 status helper
-
-`~/.config/iterm2/cc-status` is a binary that iTerm2 installs itself when you enable its
-Claude Code integration. It is not part of this repo. If it exists on the machine and
-the hook entries for it are missing, add them with:
-
-```bash
-~/envelope/install.sh --iterm-status
-```
-
-This registers it on `Notification`, `PermissionRequest`, `PostToolUse`, `PreToolUse`,
-`SessionEnd`, `SessionStart`, `Stop`, `StopFailure`, `SubagentStop` and `UserPromptSubmit`.
-
-## Troubleshooting
-
-- **No notification at all.** Run `~/envelope/test.sh`. If that shows nothing, check
-  System Settings > Notifications > terminal-notifier and Focus mode. If the test works
-  but real sessions do not, restart the session, then check that the hook is registered:
-  `jq .hooks ~/.claude/settings.json` or `cat ~/.codex/hooks.json`.
-- **Codex never notifies.** The hooks are not trusted yet. See step 5.
-- **Notifications never disappear.** `terminal-notifier -version` must be 3.1.0 or newer.
-  Run `brew upgrade terminal-notifier`.
-- **Click opens the wrong app.** The host app is detected from `__CFBundleIdentifier`,
-  then terminal environment variables, then the parent process tree. Check what the
-  session sees with `echo $__CFBundleIdentifier $TERM_PROGRAM $TERMINAL_EMULATOR`.
-- **Click does nothing in iTerm2.** macOS asks once for permission to let
-  terminal-notifier control iTerm2. Approve it under System Settings > Privacy &
-  Security > Automation.
-
-## Known limits
-
-- The ChatGPT chat app (not Codex) has no hook mechanism, so it cannot send these.
-- Android Studio is brought to the front, but the specific terminal tab is not selected.
-- Not yet verified end to end: Codex hooks firing in a live session, the Codex CLI in a
-  plain terminal, the `Fast` label, and click-through for every host app.
+- If tests work but real chats do not, review the Codex hooks and restart the chat.
+  Inspect registrations with `jq .hooks ~/.claude/settings.json` or
+  `jq .hooks ~/.codex/hooks.json`.
+- For iTerm click-through, allow terminal-notifier under **System Settings > Privacy
+  & Security > Automation**. Other IDEs/terminals only get app activation.
+- Host detection uses `__CFBundleIdentifier`, terminal environment variables, and the
+  ancestor process tree. Detached processes fall back to their provider's desktop app.
+- Local-only ChatGPT Work and Codex support these command hooks. Ordinary chat and
+  cloud-orchestrated chats do not run this local hook setup. This is a runtime
+  boundary for both providers, not a reason to use Claude branding for OpenAI events.
+  See [hook execution environments](https://learn.chatgpt.com/docs/hooks#managed-hooks-from-requirementstoml).
+- Desktop rendering, live event delivery, and click-through need a smoke test in each
+  host. The automated suite verifies payload handling and routing, not macOS UI.
 
 ## Uninstall
 
@@ -171,5 +166,5 @@ This registers it on `Notification`, `PermissionRequest`, `PostToolUse`, `PreToo
 ~/envelope/uninstall.sh
 ```
 
-Removes the `notify.sh` entries from both config files (with backups) and deletes the
-four installed files. Other hooks, settings and `terminal-notifier` are left in place.
+Removes current and legacy Envelope registrations and files, backing up changed
+configs. Other hooks, settings, backups, and `terminal-notifier` remain installed.

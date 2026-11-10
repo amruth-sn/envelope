@@ -3,7 +3,7 @@
 # Safe to re-run: files are overwritten in place, config entries are never duplicated,
 # and every config file that changes is backed up next to the original first.
 #
-#   ./install.sh                 copy the scripts into ~/.claude/hooks
+#   ./install.sh                 copy the scripts into ~/.local/share/envelope/hooks
 #   ./install.sh --link          symlink them instead, so `git pull` updates the hooks
 #   ./install.sh --iterm-status  also register iTerm2's cc-status hook (if iTerm2 installed it)
 #   ./install.sh --no-codex      skip the Codex side
@@ -12,12 +12,13 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOKS_DIR="$HOME/.claude/hooks"
+HOOKS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/envelope/hooks"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-CODEX_HOOKS="$HOME/.codex/hooks.json"
+CODEX_HOOKS="${CODEX_HOME:-$HOME/.codex}/hooks.json"
 ITERM_STATUS="$HOME/.config/iterm2/cc-status"
 MIN_TN="3.1.0"
-STAMP="$(date +%Y%m%d-%H%M%S)"
+STAMP="$(date +%Y%m%d-%H%M%S)-$$"
+source "$REPO/scripts/config.sh"
 
 link=0
 do_claude=1
@@ -64,7 +65,7 @@ fi
 # Scripts
 # ---------------------------------------------------------------------------
 mkdir -p "$HOOKS_DIR"
-for f in notify.sh focus-host.sh focus-terminal.sh claude-icon.png; do
+for f in notify.sh focus-host.sh focus-terminal.sh claude-icon.png chatgpt-icon.png; do
   src="$REPO/hooks/$f"
   dst="$HOOKS_DIR/$f"
   [ "$src" -ef "$dst" ] && continue
@@ -76,6 +77,21 @@ for f in notify.sh focus-host.sh focus-terminal.sh claude-icon.png; do
 done
 chmod +x "$REPO"/hooks/*.sh "$HOOKS_DIR"/*.sh
 say "Hook scripts installed in $HOOKS_DIR ($([ "$link" = "1" ] && echo symlinked || echo copied))"
+
+# Existing sessions cache their old hook command. Forward it to the updated hook
+# immediately; keep the old click handlers for notifications already delivered.
+legacy="$HOME/.claude/hooks/notify.sh"
+if [ -e "$legacy" ] || [ -L "$legacy" ]; then
+  shim=$(mktemp)
+  printf '#!/bin/bash\n# Envelope compatibility entry point for sessions started before migration.\nexec %q "$@"\n' "$HOOKS_DIR/notify.sh" > "$shim"
+  if ! cmp -s "$shim" "$legacy"; then
+    cp -p "$legacy" "$legacy.bak-$STAMP"
+    rm -f "$legacy"
+    cp "$shim" "$legacy"
+    chmod +x "$legacy"
+  fi
+  rm -f "$shim"
+fi
 
 # ---------------------------------------------------------------------------
 # Config merging
@@ -113,7 +129,7 @@ add_hook() {
 }
 
 if [ "$do_claude" = "1" ]; then
-  add_hook "$CLAUDE_SETTINGS" "$HOOKS_DIR/notify.sh" 10 Notification Stop PreCompact
+  envelope_config install "$CLAUDE_SETTINGS" claude
   if [ "$iterm_status" = "1" ]; then
     if [ -x "$ITERM_STATUS" ]; then
       add_hook "$CLAUDE_SETTINGS" "$ITERM_STATUS" "" \
@@ -127,7 +143,7 @@ if [ "$do_claude" = "1" ]; then
 fi
 
 if [ "$do_codex" = "1" ]; then
-  add_hook "$CODEX_HOOKS" "$HOOKS_DIR/notify.sh codex" 10 Stop PermissionRequest PreCompact
+  envelope_config install "$CODEX_HOOKS" codex
   say "Codex hooks registered in $CODEX_HOOKS"
 fi
 
@@ -136,8 +152,8 @@ cat <<MSG
 Done. Remaining manual steps:
   1. Allow notifications for terminal-notifier:
        System Settings > Notifications > terminal-notifier > Allow, style "Alerts" or "Banners".
-     Send a test to make it show up in that list:  ./test.sh
+     Send tests to make it show up in that list:  ./test.sh claude  and  ./test.sh codex
   2. Codex only: trust the new hooks once. Run /hooks in the Codex CLI, or open
-     Settings > Hooks in the ChatGPT desktop app, and approve the three notify.sh entries.
+     Settings > Hooks in the ChatGPT desktop app, and review the Envelope entries.
   3. Restart any running Claude Code / Codex sessions so they pick up the hooks.
 MSG

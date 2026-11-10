@@ -1,7 +1,7 @@
 #!/bin/bash
 # macOS notification hook shared by Claude Code and Codex.
-#   Claude Code: ~/.claude/settings.json  -> notify.sh            (Stop, Notification, PreCompact)
-#   Codex:       ~/.codex/hooks.json      -> notify.sh codex      (Stop, PermissionRequest, PreCompact)
+#   Claude Code: ~/.claude/settings.json -> notify.sh claude
+#   Codex/Work:  ~/.codex/hooks.json     -> notify.sh codex
 # Reads the hook payload JSON on stdin. Must print nothing on stdout: Codex parses
 # stdout of Stop/PermissionRequest hooks as a decision.
 #
@@ -14,26 +14,81 @@
 
 set -u
 
-agent="${1:-claude}"
+agent="${1:-}"
 
-TN=/opt/homebrew/bin/terminal-notifier
-[ -x "$TN" ] || TN=/usr/local/bin/terminal-notifier  # Intel Homebrew
+TN="${AGENT_NOTIFY_NOTIFIER:-/opt/homebrew/bin/terminal-notifier}"
+[ -x "$TN" ] || TN=$(command -v terminal-notifier 2>/dev/null)
+[ -x "$TN" ] || exit 0
 JQ=/usr/bin/jq
 [ -x "$JQ" ] || JQ=$(command -v jq)
-HOOKS_DIR="$HOME/.claude/hooks"
-ICON="$HOOKS_DIR/claude-icon.png"
+HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 TTL="${AGENT_NOTIFY_TTL:-300}"
 STATE_DIR="${TMPDIR:-/tmp}/agent-notify"
 # When 1: no ping if the exact iTerm session running this agent is already frontmost.
-SKIP_IF_FOCUSED="${CLAUDE_NOTIFY_SKIP_IF_FOCUSED:-1}"
+SKIP_IF_FOCUSED="${AGENT_NOTIFY_SKIP_IF_FOCUSED:-${CLAUDE_NOTIFY_SKIP_IF_FOCUSED:-1}}"
 
 input=$(cat)
+printf '%s' "$input" | "$JQ" -e 'type == "object"' >/dev/null 2>&1 || exit 0
 jget() { printf '%s' "$input" | "$JQ" -r "$1 // empty" 2>/dev/null; }
 
 event=$(jget '.hook_event_name')
 cwd=$(jget '.cwd')
 session_id=$(jget '.session_id')
 transcript=$(jget '.transcript_path')
+
+# Explicit commands are installed for both providers. Old/manual invocations can
+# infer a provider from positive evidence; an unknown caller never becomes Claude.
+meta=""
+[ -n "$transcript" ] && [ -f "$transcript" ] && meta=$(head -n 1 "$transcript" 2>/dev/null)
+if [ -z "$agent" ]; then
+  if printf '%s' "$meta" | "$JQ" -e '.type == "session_meta"' >/dev/null 2>&1 || [ -n "${CODEX_THREAD_ID:-}" ]; then
+    agent=codex
+  else
+    case "$transcript" in
+      "$CODEX_DIR"/*) agent=codex ;;
+      "$HOME"/.claude/*) agent=claude ;;
+      *) [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ] && agent=claude ;;
+    esac
+  fi
+fi
+case "$agent" in
+  codex|chatgpt) agent=codex; ICON="$HOOKS_DIR/chatgpt-icon.png" ;;
+  claude) ICON="$HOOKS_DIR/claude-icon.png" ;;
+  *) exit 0 ;;
+esac
+
+# Tool hooks also run in children. Their prompts and completion belong to the
+# parent agent, including guardian/reviewer agents, not to the human.
+[ -n "$(jget '.agent_id')" ] && exit 0
+case "$transcript" in */subagents/*|*/agent-*.jsonl) exit 0 ;; esac
+if printf '%s' "$meta" | "$JQ" -e '
+  .isSidechain == true or
+  (.type == "session_meta" and (.payload.source | type) == "object" and
+    .payload.source.subagent != null)' >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Never treat unrecognized lifecycle events as completion.
+case "$event" in
+  Stop|Notification|PermissionRequest|PreCompact|UserPromptSubmit) ;;
+  PreToolUse)
+    tool=$(jget '.tool_name')
+    case "$tool" in
+      AskUserQuestion|request_user_input|request_user_input_async|*.request_user_input|*.request_user_input_async|*__request_user_input|*__request_user_input_async) ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  *) exit 0 ;;
+esac
+
+safe_sid=$(printf '%s' "${session_id:-default}" | tr -c 'A-Za-z0-9_-' '_')
+group="$agent-$safe_sid"
+if [ "$event" = "UserPromptSubmit" ]; then
+  rm -f "$STATE_DIR/$group"
+  "$TN" -remove "$group" </dev/null >/dev/null 2>&1
+  exit 0
+fi
 
 dir=""
 [ -n "$cwd" ] && dir=$(basename "$cwd")
@@ -75,26 +130,44 @@ fast=0
 if [ "$agent" = "codex" ]; then
   provider="Codex"
   model=$(jget '.model')
+  effort=$(jget '.effort | if type == "object" then .level else . end')
+  reviewer=$(jget '.approvals_reviewer')
   tier=""
   if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-    tc=$(grep '"type":"turn_context"' "$transcript" 2>/dev/null | tail -n 1)
-    ts=$(grep '"thread_settings_applied"' "$transcript" 2>/dev/null | tail -n 1)
+    tc=$(grep -E '"type"[[:space:]]*:[[:space:]]*"turn_context"' "$transcript" 2>/dev/null | tail -n 1)
+    ts=$(grep -E '"type"[[:space:]]*:[[:space:]]*"thread_settings_applied"' "$transcript" 2>/dev/null | tail -n 1)
     [ -z "$model" ] && model=$(printf '%s' "$tc" | "$JQ" -r '.payload.model // empty' 2>/dev/null)
-    effort=$(printf '%s' "$tc" | "$JQ" -r '.payload.effort // .payload.reasoning_effort // empty' 2>/dev/null)
+    [ -z "$effort" ] && effort=$(printf '%s' "$tc" | "$JQ" -r '.payload.effort // .payload.reasoning_effort // empty' 2>/dev/null)
+    [ -z "$reviewer" ] && reviewer=$(printf '%s' "$tc" | "$JQ" -r '.payload.approvals_reviewer // empty' 2>/dev/null)
     [ -z "$effort" ] && effort=$(printf '%s' "$ts" | "$JQ" -r '.payload.thread_settings.reasoning_effort // empty' 2>/dev/null)
     tier=$(printf '%s' "$tc" | "$JQ" -r '.payload.service_tier // empty' 2>/dev/null)
     [ -z "$tier" ] && tier=$(printf '%s' "$ts" | "$JQ" -r '.payload.thread_settings.service_tier // empty' 2>/dev/null)
   fi
-  cfg="$HOME/.codex/config.toml"
-  toml_top() { [ -f "$cfg" ] && awk -v k="$1" '/^\[/{exit} $1==k { sub(/^[^=]*=[ \t]*/, ""); gsub(/"/, ""); print; exit }' "$cfg"; }
+  cfg="$CODEX_DIR/config.toml"
+  toml_top() { [ -f "$cfg" ] && awk -v k="$1" '
+    /^[[:space:]]*\[/{exit}
+    { line=$0; sub(/^[[:space:]]*/, "", line)
+      if (line ~ "^" k "[[:space:]]*=") {
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        sub(/[[:space:]]*#.*/, "", line)
+        gsub(/[\047\"]/, "", line); sub(/[[:space:]]*$/, "", line)
+        print line; exit
+      }
+    }' "$cfg"; }
   [ -z "$model" ] && model=$(toml_top model)
   [ -z "$effort" ] && effort=$(toml_top model_reasoning_effort)
   [ -z "$tier" ] && tier=$(toml_top service_tier)
+  [ -z "$reviewer" ] && reviewer=$(toml_top approvals_reviewer)
+  # PermissionRequest is pre-review, not proof of a user-facing prompt. Review
+  # outcomes that need the user are relayed by the root agent's question/Stop.
+  if [ "$event" = "PermissionRequest" ]; then
+    case "$reviewer" in auto_review|guardian_subagent) exit 0 ;; esac
+  fi
   case "$tier" in priority|fast) fast=1 ;; esac
   model=$(pretty_codex_model "$model")
 else
   provider="Claude"
-  effort=$(jget '.effort.level')
+  effort=$(jget '.effort | if type == "object" then .level else . end')
   speed=""
   if [ -n "$transcript" ] && [ -f "$transcript" ]; then
     last=$(tail -n 400 "$transcript" 2>/dev/null | "$JQ" -c \
@@ -183,6 +256,7 @@ case "$bundle" in
     loc="ChatGPT app"
     [[ "$session_id" =~ ^[A-Za-z0-9-]{1,64}$ ]] && deeplink="codex://threads/$session_id"
     ;;
+  com.openai.chat) loc="ChatGPT app" ;;
   com.apple.Terminal) loc="Terminal" ;;
   *) loc=$(/usr/bin/osascript -e "name of application id \"$bundle\"" 2>/dev/null) ;;
 esac
@@ -207,11 +281,14 @@ status=""
 body=""
 sound="Glass"
 case "$event" in
-  Notification|PermissionRequest)
+  Notification|PermissionRequest|PreToolUse)
     status="needs you"
     sound="Sosumi"
     if [ "$event" = "Notification" ]; then
       body=$(jget '.message' | oneline)
+    elif [ "$event" = "PreToolUse" ]; then
+      body=$(printf '%s' "$input" | "$JQ" -r '
+        [.tool_input.questions[]? | .question // .title // empty] | join(" ")' 2>/dev/null | oneline)
     else
       body=$(printf '%s' "$input" | "$JQ" -r '
         (.tool_input.description // empty),
@@ -229,7 +306,7 @@ case "$event" in
       *) body="Compacting the conversation." ;;
     esac
     ;;
-  *)
+  Stop)
     status="finished"
     body=$(jget '.last_assistant_message' | oneline)
     if [ -z "$body" ] && [ "$agent" = "claude" ] && [ -n "$transcript" ] && [ -f "$transcript" ]; then
@@ -247,15 +324,14 @@ case "$body" in -*) body=" $body" ;; esac
 # ---------------------------------------------------------------------------
 # Post, then schedule removal
 # ---------------------------------------------------------------------------
-safe_sid=$(printf '%s' "${session_id:-default}" | tr -c 'A-Za-z0-9_-' '_')
-group="$agent-$safe_sid"
-
-# Only pass shell-safe values into the -execute string (it is run through a shell).
-safe() { [[ "$1" =~ ^[A-Za-z0-9_.:/?=%-]*$ ]] && printf '%s' "$1"; }
-click="$HOOKS_DIR/focus-host.sh '$(safe "$bundle")' '$(safe "$iterm_uuid")' '$(safe "$tmux_pane")' '$(safe "$group")' '$(safe "$deeplink")'"
+# terminal-notifier executes this through a shell. Quote every argument, including
+# the installed path (HOME may contain spaces, apostrophes, or shell syntax).
+printf -v click '%q ' "$HOOKS_DIR/focus-host.sh" "$bundle" "$iterm_uuid" "$tmux_pane" "$group" "$deeplink"
 
 args=(-title "$title" -message "$body" -sound "$sound" -group "$group" -execute "$click")
 [ -n "$loc" ] && args+=(-subtitle "$loc")
+# terminal-notifier 3 removed -appIcon; provider artwork uses the supported
+# attachment API. The small system icon belongs to terminal-notifier's bundle.
 [ -f "$ICON" ] && args+=(-contentImage "$ICON")
 
 "$TN" "${args[@]}" </dev/null >/dev/null 2>&1
